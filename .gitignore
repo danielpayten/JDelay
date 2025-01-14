@@ -13,5 +13,8 @@ output/
 #SQLite DB
 *.db
 
+# Logs
+*.log
+
 # Pycache
 __pycache__/

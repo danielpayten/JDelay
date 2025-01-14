@@ -3,6 +3,7 @@
 
 # Optionally, we can write the details of fetched media to a sqlite database.
 
+from sys import exception
 import m3u8
 import urllib
 import sqlite3
@@ -10,6 +11,16 @@ import time
 import os
 import atexit
 import shutil
+import logging
+
+# Setup logging for the service
+logging.basicConfig(filename='media_fetch_service.log',
+                    filemode='a',
+                    format='%(asctime)s,%(msecs)d %(name)s %(levelname)s %(message)s',
+                    datefmt='%Y-%m-%d %H:%M:%S',
+                    level=logging.DEBUG)
+
+
 
 playlist_url = 'https://mediaserviceslive.akamaized.net/hls/live/2038308/triplejnsw/masterhq.m3u8'
 playlist_folder = './output/'
@@ -18,6 +29,7 @@ c = conn.cursor()
 
 # Create output folder if it does not exist
 if not os.path.exists(playlist_folder):
+    logging.info('Creating output folder: ' + playlist_folder)
     os.makedirs(playlist_folder)
 
 # Setup the function to be called when the service is stopped
@@ -35,27 +47,25 @@ atexit.register(cleanup)
 
 
 service_start_time = time.time()
+logging.info('Service started at: ' + str(service_start_time))
 
 while True:
 
-    # Try to fetch the playlist up to 3 times, waiting 5 seconds between each attempt.
-    try:
-        playlist = m3u8.load(playlist_url)
-    except urllib.error.HTTPError as e:
-        print('Failed to fetch playlist. Trying again...')
-        # wait and retry after 5 seconds, up to 3 times
-        for i in range(3):
-            time.sleep(5)
-            try:
-                playlist = m3u8.load(playlist_url)
-                break
-            except urllib.error.HTTPError as e:
-                print('Failed to fetch playlist. Trying again...')
+    # Try to fetch the playlist up to 5 times, waiting 5 seconds between each attempt.
+    for attempt in range(6):
+        try:
+            playlist = m3u8.load(playlist_url)
+        except urllib.error.HTTPError as e:
+            if attempt == 5:
+                print('Failed to fetch playlist after 5 attempts, exiting.')
+                logging.error('Failed to fetch playlist after 5 attempts, exiting.')
+                raise exception('Failed to fetch playlist after 5 attempts.')
+            else:
+                print('Failed to fetch playlist. Retrying...')
+                logging.warning('Failed to fetch playlist. Retrying...')
+                time.sleep(5)
                 continue
-        
-        # if we still can't fetch the playlist, we exit the service
-        if i == 2:
-            print('Failed to fetch playlist. Exiting...')
+        else:
             break
 
     playlist = m3u8.load(playlist_url)
@@ -66,35 +76,34 @@ while True:
 
         # Get the time of the most recent segment, which has been captured
         c.execute('''SELECT MAX(segment_start_time) FROM playlist''')
-        latest_fetched_segment = c.fetchone()[0]
+        most_recent_segment_time = c.fetchone()
+        
+        logging.info('Most recent segment time: ' + str(most_recent_segment_time))
 
-        if latest_fetched_segment is not None:
+        if  most_recent_segment_time[0] is not None:
             # can add directly as seconds and using epoch time.
-            segment_start_time = latest_fetched_segment + segment.duration
+            segment_start_time =  most_recent_segment_time[0] + segment.duration
         else:
             segment_start_time = service_start_time 
 
         # Determine if the segment has already been fetched, if so, skip.
         c.execute('''SELECT * FROM playlist WHERE segment_number = ?''', (segment.media_sequence,))
+        
         if c.fetchone() is not None:
+            # Segment has already been fetched, skip
             continue
 
-        
-        # Download the segment
-        try:
-            urllib.request.urlretrieve(segment.absolute_uri, playlist_folder + segment.uri)
-        except urllib.error.HTTPError as e:
-            print('Failed to download segment: ' + segment.uri + ' Trying again...')
-            # wait and retry after 5 seconds, up to 3 times
-            for i in range(3):
+        # Download the segment, attempting up to 5 times, otherwise skippipng the segment.
+        for attempt in range(5):
+            try:
+                urllib.request.urlretrieve(segment.absolute_uri, playlist_folder + segment.uri)
+            except urllib.error.HTTPError as e:
+                print('Failed to download segment: ' + segment.uri + ' Trying again...')
+                logging.warning('Failed to download segment: ' + segment.uri + ' Trying again...')
                 time.sleep(5)
-                try:
-                    urllib.request.urlretrieve(segment.absolute_uri, "." + playlist_folder + segment.uri)
-                    break
-                except urllib.error.HTTPError as e:
-                    print('Failed to download segment: ' + segment.uri + ' Trying again...')
-                    continue
-    
+                continue
+            else:
+                break
 
         # Download latest metadata
         #metadata_response = urllib.request.urlopen('''https://music.abcradio.net.au/api/v1/plays/triplej/now.json?tz=Australia%2FSydney''').read().decode('utf-8')
@@ -113,7 +122,10 @@ while True:
                  segment_start_time,
                  segment_start_time + segment.duration)
                 )
+
+
         conn.commit()
+        logging.info('Segment ' + str(segment.media_sequence) + ' fetched and stored in database.' + ' Segment start time: ' + str(segment_start_time) + ' Segment end time: ' + str(segment_start_time + segment.duration))
     # We wait 10 seconds as the segments are 10 seconds in lenght. It does not make sense to check more frequently than the segments arrive.    
     time.sleep(10)
 

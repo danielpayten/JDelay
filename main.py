@@ -18,6 +18,14 @@ import subprocess
 import signal
 from ctypes import cdll
 import os
+import logging
+
+logging.basicConfig(filename='main.log',
+                    filemode='a',
+                    format='%(asctime)s,%(msecs)d %(name)s %(levelname)s %(message)s',
+                    datefmt='%Y-%m-%d %H:%M:%S',
+                    level=logging.DEBUG)
+
 
 
 playlist_folder = './output/'
@@ -96,6 +104,21 @@ def create_playlist(delay_minutes,c,conn):
     segments = c.fetchall()
     conn.commit()
 
+    # If there are no segments skip
+    if len(segments) == 0:
+        logging.info(f'No segments for delay: {delay_minutes}')
+        logging.info('SQL Query: ' + '''
+              SELECT
+               *
+               FROM playlist
+               WHERE segment_start_time > {start_time}
+               ORDER BY
+                segment_number
+                LIMIT
+                30
+                '''.format(start_time = now - delay_minutes*60))
+                
+        return
     first_id = segments[0][0]
     m3u8_obj.media_sequence = first_id
 
