@@ -13,7 +13,7 @@ import shutil
 import logging
 
 # Setup logging for the service
-logging.basicConfig(filename=media_fetch_service.log,
+logging.basicConfig(filename='media_fetch_service.log',
                     filemode='a',
                     format='%(asctime)s,%(msecs)d %(name)s %(levelname)s %(message)s',
                     datefmt='%Y-%m-%d %H:%M:%S',

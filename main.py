@@ -20,7 +20,7 @@ from ctypes import cdll
 import os
 import logging
 
-logging.basicConfig(filename=main.log,
+logging.basicConfig(filename='main.log',
                     filemode='a',
                     format='%(asctime)s,%(msecs)d %(name)s %(levelname)s %(message)s',
                     datefmt='%Y-%m-%d %H:%M:%S',
