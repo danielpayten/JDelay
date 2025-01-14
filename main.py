@@ -18,6 +18,7 @@ import subprocess
 import signal
 from ctypes import cdll
 import os
+import logging
 
 logging.basicConfig(filename=main.log,
                     filemode='a',
