@@ -131,7 +131,7 @@ while True:
 
 
         conn.commit()
-                logging.info('Segment ' + str(segment.media_sequence) + ' fetched and stored in database.' + ' Segment start time: ' + str(segment_start_time) + ' Segment end time: ' + str(segment_start_time + segment.duration))
+        logging.info('Segment ' + str(segment.media_sequence) + ' fetched and stored in database.' + ' Segment start time: ' + str(segment_start_time) + ' Segment end time: ' + str(segment_start_time + segment.duration))
     # We wait 10 seconds as the segments are 10 seconds in lenght. It does not make sense to check more frequently than the segments arrive.    
     time.sleep(10)
 
