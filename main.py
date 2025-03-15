@@ -3,22 +3,16 @@
 # The court ruled that Optus' TV Now service did not infringe copyright because it was the user, not Optus, who was responsible for making the recording.
 # It does not matter that the recording is made on Optus' servers, because the user is the one who initiates the recording.
 
-
-# We start the media fetch service
-# We then read from the SQLite db, publishing a delayed stream
-# at the intervals:
-# 10 min
-# 30 min
-# 1,2,3,4,5... 24 hr dealyed.
-
-import sqlite3
 import time
 import m3u8
 import subprocess
+from pathlib import Path
 import signal
-from ctypes import cdll
 import os
 import logging
+import atexit
+from http.server import HTTPServer, SimpleHTTPRequestHandler
+import threading
 
 logging.basicConfig(filename='main.log',
                     filemode='a',
@@ -26,150 +20,261 @@ logging.basicConfig(filename='main.log',
                     datefmt='%Y-%m-%d %H:%M:%S',
                     level=logging.DEBUG)
 
-
+# Global variable to store the subprocess reference
+ffmpeg_process = None
+http_server = None
 
 playlist_folder = './output/'
+playlist_url = 'https://mediaserviceslive.akamaized.net/hls/live/2038308/triplejnsw/index.m3u8'
+
+
+class StreamServer(SimpleHTTPRequestHandler):
+    """Custom HTTP request handler for serving stream files"""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, directory='./output', **kwargs)
+    
+    def log_message(self, format, *args):
+        """Override to log to our logging system instead of stderr"""
+        logging.info("%s - - [%s] %s" % (self.address_string(),
+                                        self.log_date_time_string(),
+                                        format%args))
+
+def start_server(port=8080):
+    """Start the HTTP server to serve stream files"""
+    global http_server
+    server_address = ('', port)
+    http_server = HTTPServer(server_address, StreamServer)
+    logging.info(f'Starting HTTP server on port {port}')
+    server_thread = threading.Thread(target=http_server.serve_forever)
+    server_thread.daemon = True  # Set as daemon so it will be killed when main thread exits
+    server_thread.start()
+    return server_thread
+
+def start_ffmpeg_stream(playlist_url, output_dir,restart_id = 0):
+    """Start FFmpeg process to download stream segments"""
+    global ffmpeg_process
+    
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    
+    cmd = [
+        'ffmpeg',
+        '-i', playlist_url,
+        '-hls_time', '10',
+        '-strftime', '1',         # Enable timestamp in filename
+        '-hls_start_number_source', 'generic',
+        '-start_number', f'{str(restart_id)}',
+        '-hls_flags', 'second_level_segment_index+second_level_segment_duration',
+        '-hls_segment_filename', f'{output_dir}segment_%%t_%s_%%04d.ts',
+        f'{output_dir}out.m3u8'  # Output pattern
+    ]
+    
+    try:
+        ffmpeg_process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True
+        )
+        logging.info("Started FFmpeg process")
+        return ffmpeg_process
+    except Exception as e:
+        logging.error(f"Failed to start FFmpeg: {str(e)}")
+        raise
+
+def cleanup_ffmpeg():
+    """Cleanup function to terminate the FFmpeg process"""
+    global ffmpeg_process
+    if ffmpeg_process:
+        ffmpeg_process.terminate()
+    try:
+        ffmpeg_process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        logging.warning('FFmpeg process did not terminate gracefully, forcing...')
+        ffmpeg_process.kill()
+
+def cleanup_http_server():
+    """Cleanup function to terminate the HTTP server"""
+    global http_server
+    if http_server:
+        http_server.shutdown()
+        http_server.server_close()
+    
+        
+
+def signal_handler(signum, frame):
+    """Signal handler for graceful shutdown"""
+    logging.info(f'Received signal {signum}. Initiating shutdown...')
+    cleanup_ffmpeg()
+    cleanup_http_server()
+    exit(0)
+
+# Register the cleanup function to run on normal program termination
+atexit.register(cleanup_ffmpeg)
+atexit.register(cleanup_http_server)
+
+# Register signal handlers
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
+
+
+
+
 # Create output folder if it does not exist
 if not os.path.exists(playlist_folder):
     os.makedirs(playlist_folder)
 
-# Connect to the database
-conn = sqlite3.connect('j_playlist.db')
-c = conn.cursor()
-c.execute('''DROP TABLE IF EXISTS playlist''')
-c.execute('''CREATE TABLE IF NOT EXISTS playlist (segment_number INTEGER PRIMARY KEY, segment_url TEXT, segment_duration INTEGER, segment_start_time REAL, segment_end_time REAL)''')
-conn.commit()
+# We start the ffmpeg process, which will download the stream segments.
+# Start time is used to calculate the maximum delay.
+start_ffmpeg_stream(playlist_url, playlist_folder,0)
 
-
-# Start the media fetch service do this on a separate thread
-# python media_fetch_service.py
-# kill the process in the event that this script is stopped.
+# Start the HTTP server
+start_server()
 
 
 
-# Constant taken from http://linux.die.net/include/linux/prctl.h
-PR_SET_PDEATHSIG = 1
+delays = [1,5,10, 30] + list(range(60, 24*60, 60))
 
-class PrCtlError(Exception):
-    pass
-
-def on_parent_exit(signame):
-    """
-    Return a function to be run in a child process which will trigger SIGNAME
-    to be sent when the parent process dies
-    """
-    signum = getattr(signal, signame)
-    def set_parent_exit_signal():
-        # cleanup the child process when the parent dies
-
-        # http://linux.die.net/man/2/prctl
-        result = cdll['libc.so.6'].prctl(PR_SET_PDEATHSIG, signum)
-        if result != 0:
-            raise PrCtlError('prctl failed with error code %s' % result)
-
-    return set_parent_exit_signal
-
-subprocess.Popen(['python', 'media_fetch_service.py'], preexec_fn=on_parent_exit('SIGHUP'))
-
-
-
-
-delays = [1,10, 30] + list(range(60, 24*60, 60))
-
-# We now generat each of the playlists, where the requisite delay is added to the start time of each segment.
+# We now generate each of the playlists, where the requisite delay is added to the start time of each segment.
 # We can only do this for delays where the maximum delay is greater than the delay.
 
 
+class SegmentInfo:
+    def __init__(self, segment_file_name, segment_id, segment_length, segment_timestamp):
+        self.segment_file_name = segment_file_name
+        self.segment_id = segment_id
+        self.segment_length = segment_length
+        self.segment_timestamp = segment_timestamp
+
+def parse_segment_info(segment_file_name):
+    # Parse the segment info from the segment file name
+    segment_file_name = segment_file_name.name
+    segment_id = int(segment_file_name.split('_')[3].split('.')[0])
+    segment_length = float(segment_file_name.split('_')[1])/1000000
+    segment_timestamp = float(segment_file_name.split('_')[2])
+
+    return SegmentInfo(segment_file_name, segment_id, segment_length, segment_timestamp)
+
+
 # Create playlist
-def create_playlist(delay_minutes,c,conn):
-    m3u8_obj = m3u8.M3U8()
-    m3u8_obj.version = 3
-    # We use 10.00780 as the target duration as this is the duration of the segments in the playlist.
-    m3u8_obj.target_duration = 10
-    
-
+def create_playlist(delay_minutes, playlist_folder, output_file_name):
+    # Get list of segment files
     now = time.time()
+    segments = Path(playlist_folder).glob('*.ts')
+    segments_with_info = [parse_segment_info(segment) for segment in segments]
 
-    # We populate the new m3u8 object with the segments that are within the delay_minutes and m3u8_length
-    c.execute('''
-              SELECT
-               * 
-              FROM playlist 
-              WHERE segment_start_time > ?
-              ORDER BY 
-                segment_number
-              LIMIT 
-                30
-              ''',(now - delay_minutes*60,))
-    segments = c.fetchall()
-    conn.commit()
+    segments_within_delay = filter(lambda x: x.segment_timestamp >= now - delay_minutes*60, segments_with_info)
+    segments_within_delay = sorted(segments_within_delay, key=lambda x: (x.segment_timestamp, x.segment_id))
 
-    # If there are no segments skip
+
+    logging.info(f'Segments within delay: {len(segments_within_delay)}')
+    if len(segments_within_delay) >= 10:
+        # Create m3u8 object
+        m3u8_obj = m3u8.M3U8()
+        m3u8_obj.version = 3
+        m3u8_obj.target_duration = 10
+        m3u8_obj.media_sequence = segments_within_delay[0].segment_id
+
+        # Add the first 6 segments to the playlist
+        for segment in segments_within_delay[:6]:
+            m3u8_segment = m3u8.Segment()
+            m3u8_segment.uri = segment.segment_file_name
+            m3u8_segment.duration = segment.segment_length
+            m3u8_obj.add_segment(m3u8_segment)
+
+        # overwrite the playlist file
+        with open(output_file_name, 'w') as f:
+            f.write(m3u8_obj.dumps())
+
+
+def get_restart_id():
+    # Get the latest segment id
+    segments = Path(playlist_folder).glob('*.ts')
+    segments_with_info = [parse_segment_info(segment) for segment in segments]
+
+    # If there are no segments, we start from 0
+    if len(segments_with_info) == 0:
+        return 0
+    
+    # If there are segments, we start from the next segment id
+    else:
+        return max([segment.segment_id for segment in segments_with_info])+1
+
+
+def monitor_ffmpeg():
+    """Monitor FFmpeg process and restart if needed"""
+    global ffmpeg_process
+    
+    if ffmpeg_process is None or ffmpeg_process.poll() is not None:
+        logging.warning("FFmpeg process not running, restarting...")
+        
+        # We need to restart the ffmpeg process with the next segment id.
+        restart_id = get_restart_id()
+        logging.info(f'Restarting FFmpeg with segment id: {restart_id}')
+        start_ffmpeg_stream(playlist_url, playlist_folder,restart_id)
+        return False
+    
+    # Check if new segments are being created
+    try:
+        # Get the latest segment file's modification time
+        segments = [f for f in os.listdir(playlist_folder) if f.endswith('.ts')]
+        if segments:
+            latest_segment = max(segments, key=lambda x: os.path.getmtime(os.path.join(playlist_folder, x)))
+            mtime = os.path.getmtime(os.path.join(playlist_folder, latest_segment))
+            if time.time() - mtime > 60:  # No new segments in 60 seconds
+                logging.error("No new segments created in 30 seconds, restarting FFmpeg")
+                cleanup_ffmpeg()
+
+                restart_id = get_restart_id()
+                logging.info(f'Restarting FFmpeg with segment id: {restart_id}')
+                start_ffmpeg_stream(playlist_url, playlist_folder,restart_id)
+                return False
+    except Exception as e:
+        logging.error(f"Error monitoring segments: {str(e)}")
+        return False
+    
+    return True
+
+def parse_segment_times(playlist_folder):
+    
+    # Parse the segment times from the segment files
+    segments = [f for f in os.listdir(playlist_folder) if f.endswith('.ts')]
     if len(segments) == 0:
-        logging.info(f'No segments for delay: {delay_minutes}')
-        logging.info('SQL Query: ' + '''
-              SELECT
-               *
-               FROM playlist
-               WHERE segment_start_time > {start_time}
-               ORDER BY
-                segment_number
-                LIMIT
-                30
-                '''.format(start_time = now - delay_minutes*60))
-                
-        return
-    first_id = segments[0][0]
-    m3u8_obj.media_sequence = first_id
-
+        return 0
     
+    segment_times = []
     for segment in segments:
-        segment_number, segment_url, segment_duration, segment_start_time, segment_end_time = segment
-        segment = m3u8.Segment()
-        segment.uri = segment_url
-        segment.duration = segment_duration
-        m3u8_obj.add_segment(segment)
+        segment_times.append(float(segment.split('_')[-2]))
     
-    # clear the existing playlist file
-    if os.path.exists(playlist_folder + f'playlist_{delay_minutes}.m3u8'):
-        os.remove(playlist_folder + f'playlist_{delay_minutes}.m3u8')
-
-    # write the new playlist file with the new playlist
-    with open(playlist_folder + f'playlist_{delay_minutes}.m3u8', 'w') as f:
-        f.write(m3u8_obj.dumps())
+    # Calculate the maximum delay
+    maximum_delay_minutes = (max(segment_times) - min(segment_times))/60
+    return maximum_delay_minutes
 
 
-while True:
-
-    # Get the start time of the service
-    c.execute('''SELECT MIN(segment_start_time) FROM playlist''')
-    service_start_time = c.fetchone()[0]
-    conn.commit()
-    if service_start_time is None:
-        time.sleep(10)
-        print('Waiting for service to start...')
-        continue
-
-    # From this start time, we can determine the maximum delay that can be achieved.
-    # The maximum delay is always less than 24 hrs as we delete segments older than 24 hrs.
-
-    # We can determine the maximum delay by subtracting the current time from the start time.
-
-    maximum_delay = time.time() - service_start_time
-    print(f'Maximum delay: {maximum_delay/60/60} hrs')
+# main loop
 
 
-    for delay in delays:
-        if maximum_delay > delay*60:
-            create_playlist(delay, c,conn)
-        continue
-    time.sleep(10)
-    # We need to check if the service is still running
-    # Todo: Implement a check to see if the service is still running.
+def main_loop():
+    while True:
+        try:
+            monitor_ffmpeg()
+            # Create playlists for different delays
+            
+           #  Maximum delay is calculated as the time since the first segment was created.
+            maximum_delay_minutes = parse_segment_times(playlist_folder)
+            logging.info(f'Maximum delay: {maximum_delay_minutes}')
+            print(f'Maximum delay: {maximum_delay_minutes}')
+        
+            for delay_minutes in delays:
+                if maximum_delay_minutes > delay_minutes:
+                    logging.info(f'Creating playlist for delay: {delay_minutes}')
+                    output_file_name = os.path.join(playlist_folder, f'playlist_{delay_minutes}.m3u8')
+                    create_playlist(delay_minutes,playlist_folder,output_file_name)
+            
+            time.sleep(1)
+        except Exception as e:
+            logging.error(f"Error in main loop: {str(e)}")
 
-# We can now serve the m3u8 and media files using a web server.
-
-
-
+main_loop()
     
     
