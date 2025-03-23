@@ -22,33 +22,11 @@ logging.basicConfig(filename='main.log',
 
 # Global variable to store the subprocess reference
 ffmpeg_process = None
-http_server = None
 
 playlist_folder = './output/'
 playlist_url = 'https://mediaserviceslive.akamaized.net/hls/live/2038308/triplejnsw/index.m3u8'
 
 
-class StreamServer(SimpleHTTPRequestHandler):
-    """Custom HTTP request handler for serving stream files"""
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, directory='./output', **kwargs)
-    
-    def log_message(self, format, *args):
-        """Override to log to our logging system instead of stderr"""
-        logging.info("%s - - [%s] %s" % (self.address_string(),
-                                        self.log_date_time_string(),
-                                        format%args))
-
-def start_server(port=8080):
-    """Start the HTTP server to serve stream files"""
-    global http_server
-    server_address = ('', port)
-    http_server = HTTPServer(server_address, StreamServer)
-    logging.info(f'Starting HTTP server on port {port}')
-    server_thread = threading.Thread(target=http_server.serve_forever)
-    server_thread.daemon = True  # Set as daemon so it will be killed when main thread exits
-    server_thread.start()
-    return server_thread
 
 def start_ffmpeg_stream(playlist_url, output_dir,restart_id = 0):
     """Start FFmpeg process to download stream segments"""
@@ -92,26 +70,16 @@ def cleanup_ffmpeg():
     except subprocess.TimeoutExpired:
         logging.warning('FFmpeg process did not terminate gracefully, forcing...')
         ffmpeg_process.kill()
-
-def cleanup_http_server():
-    """Cleanup function to terminate the HTTP server"""
-    global http_server
-    if http_server:
-        http_server.shutdown()
-        http_server.server_close()
-    
         
 
 def signal_handler(signum, frame):
     """Signal handler for graceful shutdown"""
     logging.info(f'Received signal {signum}. Initiating shutdown...')
     cleanup_ffmpeg()
-    cleanup_http_server()
     exit(0)
 
 # Register the cleanup function to run on normal program termination
 atexit.register(cleanup_ffmpeg)
-atexit.register(cleanup_http_server)
 
 # Register signal handlers
 signal.signal(signal.SIGTERM, signal_handler)
@@ -127,10 +95,6 @@ if not os.path.exists(playlist_folder):
 # We start the ffmpeg process, which will download the stream segments.
 # Start time is used to calculate the maximum delay.
 start_ffmpeg_stream(playlist_url, playlist_folder,0)
-
-# Start the HTTP server
-start_server()
-
 
 
 delays = [1,5,10, 30] + list(range(60, 24*60, 60))
