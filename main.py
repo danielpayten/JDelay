@@ -13,6 +13,8 @@ import logging
 import atexit
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 import threading
+import json
+import sys
 
 logging.basicConfig(filename='main.log',
                     filemode='a',
@@ -20,13 +22,32 @@ logging.basicConfig(filename='main.log',
                     datefmt='%Y-%m-%d %H:%M:%S',
                     level=logging.DEBUG)
 
-# Global variable to store the subprocess reference
+# Global variables
 ffmpeg_process = None
+playlist_process = None
 
 playlist_folder = './output/'
 playlist_url = 'https://mediaserviceslive.akamaized.net/hls/live/2038308/triplejnsw/index.m3u8'
 
+delays = [2,5,10, 30] + list(range(60, 24*60, 60))
 
+def start_playlist_creator():
+    """Start the playlist creator subprocess"""
+    global playlist_process
+    
+    try:
+        playlist_process = subprocess.Popen(
+            [sys.executable, 'playlist_creator.py'],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True
+        )
+        logging.info("Started playlist creator process")
+        return playlist_process
+    except Exception as e:
+        logging.error(f"Failed to start playlist creator: {str(e)}")
+        raise
 
 def start_ffmpeg_stream(playlist_url, output_dir,restart_id = 0):
     """Start FFmpeg process to download stream segments"""
@@ -39,12 +60,21 @@ def start_ffmpeg_stream(playlist_url, output_dir,restart_id = 0):
         'ffmpeg',
         '-i', playlist_url,
         '-hls_time', '10',
-        '-strftime', '1',         # Enable timestamp in filename
+        '-live_start_index', '0',
+        '-strftime', '1',
         '-hls_start_number_source', 'generic',
         '-start_number', f'{str(restart_id)}',
         '-hls_flags', 'second_level_segment_index+second_level_segment_duration',
-        '-hls_segment_filename', f'{output_dir}segment_%%t_%s_%%04d.ts',
-        f'{output_dir}out.m3u8'  # Output pattern
+        # Audio encoding parameters for AAC-LC
+        '-c:a', 'aac',           # Use AAC encoder
+        '-b:a', '192k',          # Bitrate for AAC
+        '-ar', '48000',          # Sample rate (standard for AAC)
+        '-ac', '2',              # Number of channels (stereo)
+        '-profile:a', 'aac_low', # Use AAC-LC profile
+        '-hls_segment_filename', f'{output_dir}segment_%%t_%s_%%04d.m4a',
+        # Helps with long-running processes
+        '-ignore_io_errors', '1',
+        f'{output_dir}out.m3u8'
     ]
     
     try:
@@ -61,109 +91,59 @@ def start_ffmpeg_stream(playlist_url, output_dir,restart_id = 0):
         raise
 
 def cleanup_ffmpeg():
-    """Cleanup function to terminate the FFmpeg process"""
-    global ffmpeg_process
+    """Cleanup function to terminate ffmpeg process"""
+    global ffmpeg_process, playlist_process
+    
     if ffmpeg_process:
         ffmpeg_process.terminate()
-    try:
-        ffmpeg_process.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        logging.warning('FFmpeg process did not terminate gracefully, forcing...')
-        ffmpeg_process.kill()
-        
+        try:
+            ffmpeg_process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            logging.warning('FFmpeg process did not terminate gracefully, forcing...')
+            ffmpeg_process.kill()
+
+def cleanup_playlist_creator():
+    """Cleanup function to terminate playlist process"""
+    if playlist_process:
+        playlist_process.terminate()
+        try:
+            playlist_process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            logging.warning('Playlist creator process did not terminate gracefully, forcing...')
+            playlist_process.kill()
+
+def cleanup_processes():
+    """Cleanup function to terminate all processes"""
+    cleanup_ffmpeg()
+    cleanup_playlist_creator()
 
 def signal_handler(signum, frame):
     """Signal handler for graceful shutdown"""
     logging.info(f'Received signal {signum}. Initiating shutdown...')
-    cleanup_ffmpeg()
+    cleanup_processes()
     exit(0)
 
-# Register the cleanup function to run on normal program termination
-atexit.register(cleanup_ffmpeg)
-
-# Register signal handlers
+# Register cleanup and signal handlers
+atexit.register(cleanup_processes)
 signal.signal(signal.SIGTERM, signal_handler)
 signal.signal(signal.SIGINT, signal_handler)
-
-
-
 
 # Create output folder if it does not exist
 if not os.path.exists(playlist_folder):
     os.makedirs(playlist_folder)
 
-# We start the ffmpeg process, which will download the stream segments.
-# Start time is used to calculate the maximum delay.
-start_ffmpeg_stream(playlist_url, playlist_folder,0)
-
-
-delays = [1,5,10, 30] + list(range(60, 24*60, 60))
-
-# We now generate each of the playlists, where the requisite delay is added to the start time of each segment.
-# We can only do this for delays where the maximum delay is greater than the delay.
-
-
-class SegmentInfo:
-    def __init__(self, segment_file_name, segment_id, segment_length, segment_timestamp):
-        self.segment_file_name = segment_file_name
-        self.segment_id = segment_id
-        self.segment_length = segment_length
-        self.segment_timestamp = segment_timestamp
-
-def parse_segment_info(segment_file_name):
-    # Parse the segment info from the segment file name
-    segment_file_name = segment_file_name.name
-    segment_id = int(segment_file_name.split('_')[3].split('.')[0])
-    segment_length = float(segment_file_name.split('_')[1])/1000000
-    segment_timestamp = float(segment_file_name.split('_')[2])
-
-    return SegmentInfo(segment_file_name, segment_id, segment_length, segment_timestamp)
-
-
-# Create playlist
-def create_playlist(delay_minutes, playlist_folder, output_file_name):
-    # Get list of segment files
-    now = time.time()
-    segments = Path(playlist_folder).glob('*.ts')
-    segments_with_info = [parse_segment_info(segment) for segment in segments]
-
-    segments_within_delay = filter(lambda x: x.segment_timestamp >= now - delay_minutes*60, segments_with_info)
-    segments_within_delay = sorted(segments_within_delay, key=lambda x: (x.segment_timestamp, x.segment_id))
-
-
-    logging.info(f'Segments within delay: {len(segments_within_delay)}')
-    if len(segments_within_delay) >= 10:
-        # Create m3u8 object
-        m3u8_obj = m3u8.M3U8()
-        m3u8_obj.version = 3
-        m3u8_obj.target_duration = 10
-        m3u8_obj.media_sequence = segments_within_delay[0].segment_id
-
-        # Add the first 6 segments to the playlist
-        for segment in segments_within_delay[:6]:
-            m3u8_segment = m3u8.Segment()
-            m3u8_segment.uri = segment.segment_file_name
-            m3u8_segment.duration = segment.segment_length
-            m3u8_obj.add_segment(m3u8_segment)
-
-        # overwrite the playlist file
-        with open(output_file_name, 'w') as f:
-            f.write(m3u8_obj.dumps())
-
 
 def get_restart_id():
+    """Get the latest segment id"""
+    segments = Path(playlist_folder).glob('*.m4a')
+
     # Get the latest segment id
-    segments = Path(playlist_folder).glob('*.ts')
-    segments_with_info = [parse_segment_info(segment) for segment in segments]
+    max_id = max(
+        int(segment.name.split('_')[3].split('.')[0])
+        for segment in segments
+    )
 
-    # If there are no segments, we start from 0
-    if len(segments_with_info) == 0:
-        return 0
-    
-    # If there are segments, we start from the next segment id
-    else:
-        return max([segment.segment_id for segment in segments_with_info])+1
-
+    return max_id + 1
 
 def monitor_ffmpeg():
     """Monitor FFmpeg process and restart if needed"""
@@ -171,27 +151,26 @@ def monitor_ffmpeg():
     
     if ffmpeg_process is None or ffmpeg_process.poll() is not None:
         logging.warning("FFmpeg process not running, restarting...")
-        
-        # We need to restart the ffmpeg process with the next segment id.
         restart_id = get_restart_id()
         logging.info(f'Restarting FFmpeg with segment id: {restart_id}')
-        start_ffmpeg_stream(playlist_url, playlist_folder,restart_id)
+        start_ffmpeg_stream(playlist_url, playlist_folder, restart_id)
+        # Wait for 10 seconds for ffmpeg to start.
+        time.sleep(10)
         return False
     
-    # Check if new segments are being created
+
+    
     try:
-        # Get the latest segment file's modification time
-        segments = [f for f in os.listdir(playlist_folder) if f.endswith('.ts')]
+        segments = [f for f in os.listdir(playlist_folder) if f.endswith('.m4a')]
         if segments:
             latest_segment = max(segments, key=lambda x: os.path.getmtime(os.path.join(playlist_folder, x)))
             mtime = os.path.getmtime(os.path.join(playlist_folder, latest_segment))
-            if time.time() - mtime > 60:  # No new segments in 60 seconds
-                logging.error("No new segments created in 30 seconds, restarting FFmpeg")
+            if time.time() - mtime > 60:
+                logging.error("No new segments created in 60 seconds, restarting FFmpeg")
                 cleanup_ffmpeg()
-
                 restart_id = get_restart_id()
                 logging.info(f'Restarting FFmpeg with segment id: {restart_id}')
-                start_ffmpeg_stream(playlist_url, playlist_folder,restart_id)
+                start_ffmpeg_stream(playlist_url, playlist_folder, restart_id)
                 return False
     except Exception as e:
         logging.error(f"Error monitoring segments: {str(e)}")
@@ -199,46 +178,28 @@ def monitor_ffmpeg():
     
     return True
 
-def parse_segment_times(playlist_folder):
-    
-    # Parse the segment times from the segment files
-    segments = [f for f in os.listdir(playlist_folder) if f.endswith('.ts')]
-    if len(segments) == 0:
-        return 0
-    
-    segment_times = []
-    for segment in segments:
-        segment_times.append(float(segment.split('_')[-2]))
-    
-    # Calculate the maximum delay
-    maximum_delay_minutes = (max(segment_times) - min(segment_times))/60
-    return maximum_delay_minutes
-
-
 # main loop
+def main():
+    # Create output directory
+    if not os.path.exists(playlist_folder):
+        os.makedirs(playlist_folder)
 
+    # Start FFmpeg process
+    start_ffmpeg_stream(playlist_url, playlist_folder, 0)
+    
+    # Start playlist creator process
+    start_playlist_creator()
 
-def main_loop():
+    # Main monitoring loop
     while True:
         try:
             monitor_ffmpeg()
-            # Create playlists for different delays
-            
-           #  Maximum delay is calculated as the time since the first segment was created.
-            maximum_delay_minutes = parse_segment_times(playlist_folder)
-            logging.info(f'Maximum delay: {maximum_delay_minutes}')
-            print(f'Maximum delay: {maximum_delay_minutes}')
-        
-            for delay_minutes in delays:
-                if maximum_delay_minutes > delay_minutes:
-                    logging.info(f'Creating playlist for delay: {delay_minutes}')
-                    output_file_name = os.path.join(playlist_folder, f'playlist_{delay_minutes}.m3u8')
-                    create_playlist(delay_minutes,playlist_folder,output_file_name)
-            
             time.sleep(1)
         except Exception as e:
             logging.error(f"Error in main loop: {str(e)}")
+            time.sleep(1)
 
-main_loop()
+if __name__ == "__main__":
+    main()
     
     
