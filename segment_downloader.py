@@ -30,11 +30,12 @@ class SegmentInfo:
     filename: str
 
 class SegmentDownloader:
-    def __init__(self, output_dir: str = './output/', max_retries: int = 3, initial_backoff: float = 1.0):
+    def __init__(self, output_dir: str = './output/', max_retries: int = 5, initial_backoff: float = 1.0):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
         self.master_url = 'https://mediaserviceslive.akamaized.net/hls/live/2038308/triplejnsw/masterhq.m3u8'
         self.fetched_segments: Set[str] = set()
+        self.segment_metadata: Dict[str, SegmentInfo] = {}
         self.segment_info_file = self.output_dir / 'segment_info.json'
         self.max_retries = max_retries
         self.initial_backoff = initial_backoff
@@ -58,20 +59,33 @@ class SegmentDownloader:
                 with open(self.segment_info_file, 'r') as f:
                     data = json.load(f)
                     self.fetched_segments = set(data.get('fetched_segments', []))
+                    self.segment_metadata = data.get('segment_metadata', {})
                 logging.info(f"Loaded {len(self.fetched_segments)} previously fetched segments")
         except Exception as e:
             logging.error(f"Error loading segment info: {str(e)}")
 
     def save_segment_info(self):
-        """Save fetched segment information"""
+        """Save fetched segment information using atomic file operations"""
         try:
-            with open(self.segment_info_file, 'w') as f:
+            # Create temporary file in the same directory
+            temp_file = self.segment_info_file.with_suffix('.json.tmp')
+            
+            # Write to temporary file
+            with open(temp_file, 'w') as f:
                 json.dump({
                     'fetched_segments': list(self.fetched_segments),
+                    'segment_metadata': self.segment_metadata,
                     'last_updated': datetime.now().isoformat()
                 }, f)
+            
+            # Atomic rename operation
+            temp_file.replace(self.segment_info_file)
+            
         except Exception as e:
             logging.error(f"Error saving segment info: {str(e)}")
+            # Clean up temp file if it exists
+            if temp_file.exists():
+                temp_file.unlink()
 
     def fetch_playlist(self, url: str) -> Optional[m3u8.M3U8]:
         """Fetch and parse a playlist with retry logic"""
@@ -97,13 +111,23 @@ class SegmentDownloader:
 
         for attempt in range(self.max_retries):
             try:
-                response = self.session.get(segment_info.url, stream=True)
+                # Add timeout to prevent hanging on slow connections
+                response = self.session.get(segment_info.url, stream=True, timeout=(5, 30))
                 response.raise_for_status()
                 
-                with open(output_path, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
+                # Use a temporary file for atomic writes
+                temp_path = output_path + '.tmp'
+                try:
+                    with open(temp_path, 'wb') as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                    # Atomic rename
+                    os.replace(temp_path, output_path)
+                finally:
+                    # Clean up temp file if something went wrong
+                    if os.path.exists(temp_path):
+                        os.unlink(temp_path)
                 
                 logging.info(f"Downloaded segment: {segment_info.filename}")
                 return True
@@ -119,12 +143,14 @@ class SegmentDownloader:
         """Process and download new segments"""
         try:
             # Fetch playlist
+            logging.info(f"Fetching playlist from {self.master_url}")
             playlist = self.fetch_playlist(self.master_url)
             if not playlist:
                 return
 
             base_url = self.master_url.rsplit('/', 1)[0] + '/'
             new_segments = 0
+
 
             # Process segments
             for segment in playlist.segments:
@@ -136,11 +162,19 @@ class SegmentDownloader:
                         duration=segment.duration,
                         timestamp=segment.program_date_time.timestamp() if segment.program_date_time else time.time(),
                         sequence=segment.media_sequence,
-                        filename=f"segment_{int(segment.duration * 1000000)}_{int(segment.program_date_time.timestamp() if segment.program_date_time else time.time())}_{segment.media_sequence:04d}.m4a"
+                        filename=f"segment_{segment.media_sequence:04d}.aac"
                     )
-
+                    logging.info(f"Attempting to download segment {segment_info.filename}")
                     if self.download_segment(segment_info):
+                        logging.info(f"Downloaded segment {segment_info.filename}")
                         self.fetched_segments.add(segment_url)
+                        self.segment_metadata[str(segment.media_sequence)] = {
+                            'url': segment_url,
+                            'duration': segment_info.duration,
+                            'timestamp': segment_info.timestamp,
+                            'sequence': segment_info.sequence,
+                            'filename': segment_info.filename
+                        }
                         new_segments += 1
 
             if new_segments > 0:
@@ -149,7 +183,11 @@ class SegmentDownloader:
 
             # Clean up old segments from memory (keep last 1000)
             if len(self.fetched_segments) > 1000:
+                old_segments = set(list(self.fetched_segments)[:-1000])
                 self.fetched_segments = set(list(self.fetched_segments)[-1000:])
+                # Clean up metadata for old segments
+                for segment_url in old_segments:
+                    self.segment_metadata.pop(segment_url, None)
 
         except Exception as e:
             logging.error(f"Error processing segments: {str(e)}")
