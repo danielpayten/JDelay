@@ -33,7 +33,7 @@ class SegmentDownloader:
     def __init__(self, output_dir: str = './output/', max_retries: int = 5, initial_backoff: float = 1.0):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
-        self.master_url = 'https://mediaserviceslive.akamaized.net/hls/live/2038308/triplejnsw/masterhq.m3u8'
+        self.master_url = 'https://mediaserviceslive.akamaized.net/hls/live/2109456/triplejnsw/v0-221.m3u8'
         self.fetched_segments: Set[str] = set()
         self.segment_metadata: Dict[str, SegmentInfo] = {}
         self.segment_info_file = self.output_dir / 'segment_info.json'

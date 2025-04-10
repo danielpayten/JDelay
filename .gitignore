@@ -6,6 +6,8 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+.DS_Store
+.code_workspace
 
 # Output
 output/
@@ -18,3 +20,4 @@ output/
 
 # Pycache
 __pycache__/
+JDelay.code-workspace

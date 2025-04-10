@@ -28,11 +28,11 @@ ffmpeg_process = None
 playlist_process = None
 
 playlist_folder = './output/'
-playlist_url = 'https://mediaserviceslive.akamaized.net/hls/live/2038308/triplejnsw/index.m3u8'
+
 
 delays_seconds = [60*x for x in ([2,5,10, 30] + list(range(60, 24*60, 60)))]
 buffer_period_seconds = 1 * 60 # 1 minute
-hls_length = 1.5 * 60 # 1.5 minutes
+hls_length = 1.0 * 60 # 1.0 minutes
 
 @dataclass
 class PlaylistSpec:

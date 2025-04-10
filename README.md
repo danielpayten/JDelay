@@ -23,6 +23,6 @@ See: https://classic.austlii.edu.au/au/journals/JlALawTA/2012/8.pdf
 Install dependencies
 1. m3u8
 2. run `python3 main.py`
-3. host `python -m http.server 8080 --bind 127.0.0.1 --directory ./output`
+3. run `serve_http.py` to serve the files. Modify as appropriate for however you want to serve these files. Eg. Write something to upload to an AWS bucket.
 4. allow sufficent buffer to build up Eg. Now Australia is GMT - 11, so I need to wait 11 hours before 'real time' streaming.
 5. open with VLC 'localhost:8080/playlist_660.m3u8` (660 is 11hrs * 60 min)
