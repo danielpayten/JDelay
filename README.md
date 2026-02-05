@@ -26,3 +26,25 @@ Install dependencies
 3. run `serve_http.py` to serve the files. Modify as appropriate for however you want to serve these files. Eg. Write something to upload to an AWS bucket.
 4. allow sufficent buffer to build up Eg. Now Australia is GMT - 11, so I need to wait 11 hours before 'real time' streaming.
 5. open with VLC 'localhost:8080/playlist_660.m3u8` (660 is 11hrs * 60 min)
+
+## Docker / Jetson Nano
+
+To run in a container (e.g. on a Jetson Nano):
+
+**On the Jetson Nano (native ARM64):**
+```bash
+docker compose build
+docker compose up -d
+```
+Then open `http://<jetson-ip>:8080/playlist_660.m3u8` in VLC (or use the delay you need).
+
+**Building an ARM64 image on an x86 machine for deploy to Jetson:**
+```bash
+docker build --platform linux/arm64 -t jdelay .
+docker save jdelay | gzip > jdelay-arm64.tar.gz
+# Copy jdelay-arm64.tar.gz to the Jetson, then:
+# docker load < jdelay-arm64.tar.gz
+# docker run -d -p 8080:8080 -v jdelay_output:/app/output -v jdelay_logs:/app/logs --restart unless-stopped jdelay
+```
+
+**Optional env vars:** `JDELAY_HTTP_PORT` (default 8080), `JDELAY_HTTP_DIR` (default `/app/output`). Output and logs are stored in Docker volumes so the buffer survives container restarts.

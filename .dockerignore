@@ -1,0 +1,25 @@
+# Git and env
+.git
+.gitignore
+.env
+.venv
+env/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache
+.mypy_cache
+
+# Output and logs (created at runtime in container)
+output/
+logs/
+*.log
+
+# IDE and OS
+.DS_Store
+*.code-workspace
+.cursor
+
+# Docs (optional: add README to image if you want)
+# README.md
