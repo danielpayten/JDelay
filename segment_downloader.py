@@ -1,24 +1,27 @@
 import time
-import m3u8
-import requests
+import signal
+import m3u8  # type: ignore[import-untyped]
+import requests  # type: ignore[import-untyped]
 from pathlib import Path
 import logging
 import json
 import os
-from typing import Set, Dict, Optional
+from typing import Set, Dict, Optional, Union
 from urllib.parse import urljoin
 from dataclasses import dataclass
 from datetime import datetime
-from requests.adapters import HTTPAdapter
-from urllib3.util import Retry
+from requests.adapters import HTTPAdapter  # type: ignore[import-untyped]
+from urllib3.util import Retry  # type: ignore[import-untyped]
 
-# Configure logging
+from config import OUTPUT_DIR, LOG_DIR
+
+LOG_DIR.mkdir(exist_ok=True)
 logging.basicConfig(
-    filename='segment_downloader.log',
-    filemode='a',
-    format='%(asctime)s,%(msecs)d %(name)s %(levelname)s %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S',
-    level=logging.DEBUG
+    filename=LOG_DIR / "segment_downloader.log",
+    filemode="a",
+    format="%(asctime)s,%(msecs)d %(name)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    level=logging.DEBUG,
 )
 
 @dataclass
@@ -30,8 +33,8 @@ class SegmentInfo:
     filename: str
 
 class SegmentDownloader:
-    def __init__(self, output_dir: str = './output/', max_retries: int = 5, initial_backoff: float = 1.0):
-        self.output_dir = Path(output_dir)
+    def __init__(self, output_dir: Optional[Union[str, Path]] = None, max_retries: int = 5, initial_backoff: float = 1.0):
+        self.output_dir = Path(output_dir) if output_dir is not None else OUTPUT_DIR
         self.output_dir.mkdir(exist_ok=True)
         self.master_url = 'https://mediaserviceslive.akamaized.net/hls/live/2109456/triplejnsw/v0-221.m3u8'
         self.fetched_segments: Set[str] = set()
@@ -181,31 +184,45 @@ class SegmentDownloader:
                 logging.info(f"Downloaded {new_segments} new segments")
                 self.save_segment_info()
 
-            # Clean up old segments from memory (keep last 1000)
-            if len(self.fetched_segments) > 1000:
-                old_segments = set(list(self.fetched_segments)[:-1000])
-                self.fetched_segments = set(list(self.fetched_segments)[-1000:])
-                # Clean up metadata for old segments
-                for segment_url in old_segments:
-                    self.segment_metadata.pop(segment_url, None)
+            # Clean up old segments from memory (keep last 1000 by sequence)
+            if len(self.segment_metadata) > 1000:
+                sorted_sequences = sorted(self.segment_metadata.keys(), key=int)
+                to_remove = sorted_sequences[:-1000]
+                for seq in to_remove:
+                    self.segment_metadata.pop(seq, None)
+                # Also trim fetched_segments by keeping only URLs for remaining sequences
+                remaining_urls = {m['url'] for m in self.segment_metadata.values()}
+                self.fetched_segments &= remaining_urls
 
         except Exception as e:
             logging.error(f"Error processing segments: {str(e)}")
 
     def run(self, check_interval: int = 3):
-        """Run the segment downloader"""
+        """Run the segment downloader. Handles SIGTERM/SIGINT for graceful shutdown."""
+        shutdown_requested = False
+
+        def request_shutdown(signum, frame):
+            nonlocal shutdown_requested
+            shutdown_requested = True
+            logging.info("Shutdown requested (signal %s), saving state and exiting...", signum)
+
+        signal.signal(signal.SIGTERM, request_shutdown)
+        signal.signal(signal.SIGINT, request_shutdown)
+
         logging.info("Starting segment downloader")
         try:
-            while True:
+            while not shutdown_requested:
                 self.process_segments()
-                time.sleep(check_interval)
-        except KeyboardInterrupt:
-            logging.info("Stopping segment downloader")
-            self.save_segment_info()
+                for _ in range(check_interval):
+                    if shutdown_requested:
+                        break
+                    time.sleep(1)
         except Exception as e:
-            logging.error(f"Error in main loop: {str(e)}")
+            logging.error("Error in main loop: %s", e)
+        finally:
+            logging.info("Stopping segment downloader")
             self.save_segment_info()
 
 if __name__ == "__main__":
-    downloader = SegmentDownloader()
+    downloader = SegmentDownloader(output_dir=OUTPUT_DIR)
     downloader.run()

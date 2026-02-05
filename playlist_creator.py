@@ -1,28 +1,34 @@
 import time
+import signal
 import m3u8
 from pathlib import Path
 import logging
-import sys
-from dataclasses import dataclass
-from typing import List
-from main import playlist_folder, buffer_period_seconds, PlaylistSpec, hls_length
 import json
 import os
+from typing import List
 
-# Configure logging
+from config import (
+    OUTPUT_DIR,
+    BUFFER_PERIOD_SECONDS,
+    HLS_LENGTH_SECONDS,
+    PlaylistSpec,
+    LOG_DIR,
+)
+
+LOG_DIR.mkdir(exist_ok=True)
 logging.basicConfig(
-    filename='/Users/danielpayten/Desktop/JDelay Logs/JDelay/playlist_creator.log',
-    filemode='a',
-    format='%(asctime)s,%(msecs)d %(name)s %(levelname)s %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S',
-    level=logging.DEBUG
+    filename=LOG_DIR / "playlist_creator.log",
+    filemode="a",
+    format="%(asctime)s,%(msecs)d %(name)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    level=logging.DEBUG,
 )
 
 
 
 
 def get_segment_infos():
-    segment_info_file = Path(playlist_folder) / 'segment_info.json'
+    segment_info_file = OUTPUT_DIR / "segment_info.json"
     if not os.path.exists(segment_info_file):
         return None
     with open(segment_info_file, 'r') as f:
@@ -37,7 +43,7 @@ def initialise_playlist(playlist_spec: PlaylistSpec, output_folder: Path):
     # Convert dictionary values to list and filter
     segments_in_delay = [
         segment for segment in segment_metadata.values()
-        if segment['timestamp'] - (playlist_spec.playlist_start_time - playlist_spec.delay_seconds - buffer_period_seconds) > 0
+        if segment["timestamp"] - (playlist_spec.playlist_start_time - playlist_spec.delay_seconds - BUFFER_PERIOD_SECONDS) > 0
     ]
 
     # Get the first segment_id which meets the delay
@@ -88,15 +94,15 @@ def populate_playlist(playlist_spec: PlaylistSpec, segment_infos: dict):
     
     # We need to get the segments which are in the delay
 
-    broadcast_time = time.time() - playlist_spec.delay_seconds - buffer_period_seconds
+    broadcast_time = time.time() - playlist_spec.delay_seconds - BUFFER_PERIOD_SECONDS
     # We need to get the segments which are in the delay
     output_segments = [
         segment for segment in segments_table
-        if segment['start_time'] <= broadcast_time <= segment['end_time'] + hls_length
+        if segment["start_time"] <= broadcast_time <= segment["end_time"] + HLS_LENGTH_SECONDS
     ]
 
     # Create temporary file
-    playlist_path = Path(playlist_folder) / f'playlist_{playlist_spec.delay_seconds}.m3u8'
+    playlist_path = OUTPUT_DIR / f"playlist_{playlist_spec.delay_seconds}.m3u8"
     temp_file = playlist_path.with_suffix('.m3u8.tmp')
     
     # If there are no segments, we don't need to write a playlist
@@ -123,47 +129,66 @@ def populate_playlist(playlist_spec: PlaylistSpec, segment_infos: dict):
 
 
 def main(playlists_spec: List[PlaylistSpec]):
-    """Main function for playlist creator process"""
-    
+    """Main function for playlist creator process. Handles SIGTERM/SIGINT for graceful shutdown."""
+    spec_file = OUTPUT_DIR / "playlist_spec.json"
+    shutdown_requested = False
 
-    # If the playlist spec file exists, we need to resume from where we left off
-    if os.path.exists(Path(playlist_folder) / 'playlist_spec.json'):
-        with open(Path(playlist_folder) / 'playlist_spec.json', 'r') as f:
-            playlists_spec = json.load(f)
+    def request_shutdown(signum, frame):
+        nonlocal shutdown_requested
+        shutdown_requested = True
+        logging.info("Shutdown requested (signal %s), saving state and exiting...", signum)
+
+    signal.signal(signal.SIGTERM, request_shutdown)
+    signal.signal(signal.SIGINT, request_shutdown)
+
+    # If the playlist spec file exists, resume from where we left off (convert dicts to PlaylistSpec)
+    if spec_file.exists():
+        try:
+            with open(spec_file, "r") as f:
+                data = json.load(f)
+            playlists_spec = [PlaylistSpec(**s) for s in data]
+        except Exception as e:
+            logging.warning("Could not load playlist_spec.json, using env/defaults: %s", e)
 
     specs_to_run = []
-    while True:
-        current_time = time.time()
-            
-        # Process the list of playlists which have the delays met
-        for initial_spec in playlists_spec:
-            if not initial_spec.is_initalised and current_time >= initial_spec.playlist_start_time + initial_spec.delay_seconds + buffer_period_seconds:
-                initial_spec = initialise_playlist(initial_spec, Path(playlist_folder))
-                specs_to_run.append(initial_spec)
+    try:
+        while not shutdown_requested:
+            current_time = time.time()
 
-        # If there are any playlists to run, we get the segment infos
-        if os.path.exists(Path(playlist_folder) / 'segment_info.json') and len(specs_to_run) > 0:
-            segment_infos = get_segment_infos()
-            
-        for run in specs_to_run:
-            populate_playlist(run, segment_infos)
+            # Process the list of playlists which have the delays met
+            for initial_spec in playlists_spec:
+                if not initial_spec.is_initalised and current_time >= initial_spec.playlist_start_time + initial_spec.delay_seconds + BUFFER_PERIOD_SECONDS:
+                    initial_spec = initialise_playlist(initial_spec, OUTPUT_DIR)
+                    specs_to_run.append(initial_spec)
 
-        # Save the playlist spec, so we can resume from where we left off, in case of a crash
-        with open(Path(playlist_folder) / 'playlist_spec.json', 'w') as f:
-            json.dump([spec.__dict__ for spec in playlists_spec], f)
-        
-        # Wait for 1 second
-        time.sleep(1)
+            # If there are any playlists to run, we get the segment infos
+            if (OUTPUT_DIR / "segment_info.json").exists() and len(specs_to_run) > 0:
+                segment_infos = get_segment_infos()
+            else:
+                segment_infos = None
+
+            if segment_infos:
+                for run in specs_to_run:
+                    populate_playlist(run, segment_infos)
+
+            # Save the playlist spec so we can resume after a crash or restart
+            with open(spec_file, "w") as f:
+                json.dump([vars(spec) for spec in playlists_spec], f)
+
+            time.sleep(1)
+    finally:
+        # Final save on shutdown so restarts pick up latest state
+        try:
+            with open(spec_file, "w") as f:
+                json.dump([vars(spec) for spec in playlists_spec], f)
+            logging.info("Saved playlist spec on shutdown")
+        except Exception as e:
+            logging.warning("Could not save playlist spec on shutdown: %s", e)
 
 
 if __name__ == "__main__":
-    import sys
-    import json
-    
-    # Get playlists to create from environment variable
+    # Get playlists to create from environment variable (set by main.py when spawning)
     playlists_spec = []
-    if 'PLAYLISTS_SPEC' in os.environ:
-        playlists_dict = json.loads(os.environ['PLAYLISTS_SPEC'])
-        playlists_spec = [PlaylistSpec(**spec) for spec in playlists_dict]
-
+    if "PLAYLISTS_SPEC" in os.environ:
+        playlists_spec = [PlaylistSpec(**s) for s in json.loads(os.environ["PLAYLISTS_SPEC"])]
     main(playlists_spec)

@@ -3,58 +3,52 @@
 # The court ruled that Optus' TV Now service did not infringe copyright because it was the user, not Optus, who was responsible for making the recording.
 # It does not matter that the recording is made on Optus' servers, because the user is the one who initiates the recording.
 
-from dataclasses import dataclass
 import time
-import m3u8
 import subprocess
 from pathlib import Path
 import signal
 import os
 import logging
 import atexit
-from http.server import HTTPServer, SimpleHTTPRequestHandler
-import threading
 import json
 import sys
 
-logging.basicConfig(filename='main.log',
-                    filemode='a',
-                    format='%(asctime)s,%(msecs)d %(name)s %(levelname)s %(message)s',
-                    datefmt='%Y-%m-%d %H:%M:%S',
-                    level=logging.DEBUG)
+from config import (
+    OUTPUT_DIR,
+    DELAYS_SECONDS,
+    PlaylistSpec,
+    LOG_DIR,
+    PROJECT_DIR,
+)
+
+# Ensure log dir exists and configure logging
+LOG_DIR.mkdir(exist_ok=True)
+logging.basicConfig(
+    filename=LOG_DIR / "main.log",
+    filemode="a",
+    format="%(asctime)s,%(msecs)d %(name)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    level=logging.DEBUG,
+)
 
 # Global variables
 ffmpeg_process = None
 playlist_process = None
-
-playlist_folder = './output/'
-
-
-delays_seconds = [60*x for x in ([2,5,10, 30] + list(range(60, 24*60, 60)))]
-buffer_period_seconds = 1 * 60 # 1 minute
-hls_length = 1.0 * 60 # 1.0 minutes
-
-@dataclass
-class PlaylistSpec:
-    delay_seconds: int
-    playlist_start_time: float
-    playlist_file_name: str
-    first_segment_id: int
-    is_initalised: bool = False
-    is_running: bool = False
+segment_downloader_process = None
 
 
 def start_segment_downloader():
     """Start the segment downloader subprocess"""
     global segment_downloader_process
-    
+
     try:
         segment_downloader_process = subprocess.Popen(
-            [sys.executable, './segment_downloader.py'],
+            [sys.executable, str(PROJECT_DIR / "segment_downloader.py")],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            universal_newlines=True
+            universal_newlines=True,
+            cwd=str(PROJECT_DIR),
         )
         logging.info("Started segment downloader process")
         return segment_downloader_process
@@ -83,11 +77,12 @@ def start_playlist_creator(playlists_spec):
         env['PLAYLISTS_SPEC'] = json.dumps(playlists_dict)
         
         playlist_process = subprocess.Popen(
-            [sys.executable, './playlist_creator.py'],
+            [sys.executable, str(PROJECT_DIR / "playlist_creator.py")],
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            universal_newlines=True
+            universal_newlines=True,
+            cwd=str(PROJECT_DIR),
         )
         
         # Check if process started successfully
@@ -170,23 +165,36 @@ signal.signal(signal.SIGTERM, signal_handler)
 signal.signal(signal.SIGINT, signal_handler)
 
 # Create output folder if it does not exist
-if not os.path.exists(playlist_folder):
-    os.makedirs(playlist_folder)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def load_persisted_playlist_spec():
+    """Load playlist specs from disk for resume after restart. Returns None if not available."""
+    spec_file = OUTPUT_DIR / "playlist_spec.json"
+    if not spec_file.exists():
+        return None
+    try:
+        with open(spec_file, "r") as f:
+            data = json.load(f)
+        if not data:
+            return None
+        return [PlaylistSpec(**s) for s in data]
+    except Exception as e:
+        logging.warning(f"Could not load persisted playlist spec: {e}")
+        return None
 
 
 # main loop
 def main():
     start_time = time.time()
-    # Create output directory
-    if not os.path.exists(playlist_folder):
-        os.makedirs(playlist_folder)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     start_segment_downloader()
 
-    playlists_to_create = []
-    for delay in delays_seconds:
-        playlists_to_create.append(PlaylistSpec(delay, start_time, f'playlist_{delay}.m3u8', first_segment_id=None, is_initalised= False))
-    
+    playlists_to_create = [
+        PlaylistSpec(delay, start_time, f"playlist_{delay}.m3u8")
+        for delay in DELAYS_SECONDS
+    ]
     start_playlist_creator(playlists_to_create)
 
     # Keep main process running and monitor subprocesses
@@ -194,11 +202,11 @@ def main():
         while True:
             # Check segment downloader health
             if not check_process_health(
-                segment_downloader_process, 
-                "Segment downloader", 
-                playlist_folder, 
-                '.aac', 
-                60
+                segment_downloader_process,
+                "Segment downloader",
+                str(OUTPUT_DIR),
+                ".aac",
+                60,
             ):
                 logging.warning("Restarting segment downloader...")
                 cleanup_segment_downloader()
@@ -208,15 +216,17 @@ def main():
             
             # Check playlist creator health
             if not check_process_health(
-                playlist_process, 
+                playlist_process,
                 "Playlist creator",
-                playlist_folder,
-                '.m3u8',
-                60
+                str(OUTPUT_DIR),
+                ".m3u8",
+                60,
             ):
                 logging.warning("Restarting playlist creator...")
                 cleanup_playlist_creator()
-                start_playlist_creator(playlists_to_create)
+                # Use persisted state so delay playlists resume correctly
+                playlists_spec = load_persisted_playlist_spec() or playlists_to_create
+                start_playlist_creator(playlists_spec)
                 
             time.sleep(1)  # Check every second
     except KeyboardInterrupt:

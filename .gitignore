@@ -17,6 +17,7 @@ output/
 
 # Logs
 *.log
+logs/
 
 # Pycache
 __pycache__/
